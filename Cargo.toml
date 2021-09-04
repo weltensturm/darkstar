@@ -1,0 +1,16 @@
+[package]
+name = "darkstar"
+version = "0.0.1"
+edition = "2018"
+
+[dependencies]
+wasapi = "0.4.1"
+log = "^0.4.0"
+simplelog = "^0.10.0"
+rustfft = "^6.0.1"
+terminal_size = "^0.1.17"
+crossterm = "^0.21.0"
+vulkano = "0.24.0"
+vulkano-shaders = "0.24.0"
+vulkano-win = "0.24.0"
+winit = "0.25"
