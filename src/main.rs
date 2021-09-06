@@ -15,7 +15,7 @@ extern crate log;
 use simplelog::*;
 
 
-const UPPER_BOUND: usize = 4096*3;
+const UPPER_BOUND: usize = 4096*4;
 
 
 fn main() -> Res<()> {
@@ -35,7 +35,7 @@ fn main() -> Res<()> {
 
     let (gfx_sender, gfx_receiver) = sync_channel(1);
 
-    let chunksize = 4096*3;
+    let chunksize = 4096*2;
 
     let _ = thread::Builder::new()
         .name("Capture".to_string())
@@ -112,7 +112,9 @@ fn fft_loop(raw: Receiver<Vec<u8>>, transformed: SyncSender<Vec<f32>>){
             frame_start = Instant::now();
             fft.process(&mut buffer);
             //print_bars(buffer.iter().map(|x| x.to_polar().0).collect::<Vec<f32>>());
-            transformed.send(buffer.iter().map(|x| x.to_polar().0).collect::<Vec<f32>>());
+            let mut half = buffer.iter().map(|x| x.to_polar().0).collect::<Vec<f32>>();
+            half = half[0..half.len()/2].to_vec();
+            transformed.send(half);
             print!("{:?}       ", Instant::now() - frame_start);
         }
     }
@@ -126,7 +128,9 @@ fn capture_loop(tx_capt: SyncSender<Vec<u8>>, chunksize: usize) -> Res<()> {
     let device = get_default_device(&Direction::Render)?;
     let mut audio_client = device.get_iaudioclient()?;
 
-    let desired_format = WaveFormat::new(32, 32, &SampleType::Float, 44100, 2);
+    let channels = 1;
+
+    let desired_format = WaveFormat::new(32, 32, &SampleType::Float, 44100, channels);
 
     let blockalign = desired_format.get_blockalign();
 
@@ -146,7 +150,7 @@ fn capture_loop(tx_capt: SyncSender<Vec<u8>>, chunksize: usize) -> Res<()> {
 
     let render_client = audio_client.get_audiocaptureclient()?;
     let mut sample_queue: VecDeque<u8> = VecDeque::with_capacity(
-        blockalign as usize * buffer_frame_count as usize,
+        channels * blockalign as usize * buffer_frame_count as usize,
     );
     audio_client.start_stream()?;
     loop {

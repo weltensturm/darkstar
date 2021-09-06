@@ -21,6 +21,7 @@ use vulkano_win::VkSurfaceBuild;
 use winit::event::{Event, WindowEvent};
 use winit::event_loop::{ControlFlow, EventLoop};
 use winit::platform::windows::{WindowBuilderExtWindows};
+use std::f32::consts::PI;
 
 
 pub fn window_loop(receiver: Receiver<Vec<f32>>) {
@@ -79,44 +80,18 @@ pub fn window_loop(receiver: Receiver<Vec<f32>>) {
             .unwrap()
     };
 
-    let vertex_buffer = {
-        #[derive(Default, Debug, Clone)]
-        struct Vertex {
-            position: [f32; 2],
-        }
-        vulkano::impl_vertex!(Vertex, position);
-
-        CpuAccessibleBuffer::from_iter(
-            device.clone(),
-            BufferUsage::all(),
-            false,
-            [
-                Vertex {
-                    position: [-0.5, -0.25],
-                },
-                Vertex {
-                    position: [0.0, 0.5],
-                },
-                Vertex {
-                    position: [0.25, -0.1],
-                },
-            ]
-            .iter()
-            .cloned(),
-        )
-        .unwrap()
-    };
-
     mod vs {
         vulkano_shaders::shader! {
             ty: "vertex",
             src: "
 				#version 450
 
-				layout(location = 0) in vec2 position;
+				layout(location = 0) in vec3 position;
+                layout(location = 0) out vec4 out_position;
 
 				void main() {
-					gl_Position = vec4(position, 0.0, 1.0);
+                    out_position = vec4(position, 1.0); 
+					gl_Position = vec4(position, 1.0);
 				}
 			"
         }
@@ -128,10 +103,15 @@ pub fn window_loop(receiver: Receiver<Vec<f32>>) {
             src: "
 				#version 450
 
+                layout(location = 0) in vec4 position;
 				layout(location = 0) out vec4 f_color;
 
 				void main() {
-					f_color = vec4(1.0, 0.0, 0.0, 1.0);
+					f_color = vec4(
+                        min(position.z, 1),
+                        min(position.z*3 - 1, 1.0),
+                        min(position.z*3 - 2, 1.0),
+                        1.0);
 				}
 			"
         }
@@ -163,7 +143,7 @@ pub fn window_loop(receiver: Receiver<Vec<f32>>) {
         GraphicsPipeline::start()
             .vertex_input_single_buffer()
             .vertex_shader(vs.main_entry_point(), ())
-            .triangle_list()
+            .line_strip()
             .viewports_dynamic_scissors_irrelevant(1)
             .fragment_shader(fs.main_entry_point(), ())
             .render_pass(Subpass::from(render_pass.clone(), 0).unwrap())
@@ -242,14 +222,16 @@ pub fn window_loop(receiver: Receiver<Vec<f32>>) {
                     }
                     Err(err) => return,
                 }
-
+                let log_base = 1.015f32;
+                print!("{}", log_base);
+                
                 let vertex_buffer = {
                     #[derive(Default, Debug, Clone)]
                     struct Vertex {
-                        position: [f32; 2],
+                        position: [f32; 3],
                     }
                     vulkano::impl_vertex!(Vertex, position);
-            
+                    
                     CpuAccessibleBuffer::from_iter(
                         device.clone(),
                         BufferUsage::all(),
@@ -257,8 +239,10 @@ pub fn window_loop(receiver: Receiver<Vec<f32>>) {
                         fft
                         .iter()
                         .enumerate()
-                        //.map(|(i, x)| Vertex { position: [i as f32 / fft.len() as f32 * 2f32 - 1f32, x/255f32] })
-                        .map(|(i, x)| Vertex { position: [i as f32 / fft.len() as f32 * 4f32 - 2f32, x/255f32 - 0.25f32] })
+                        //.map(|(i, x)| Vertex { position: [log_base.powi(i as i32) * 2f32 - 1f32, x/255f32] })
+                        //.map(|(i, x)| Vertex { position: [i as f32 / fft.len() as f32 * 2f32 - 1f32, - x/255f32 + 0.5f32] })
+                        //.map(|(i, x)| Vertex { position: [(i as f32).log(1.1f32) / (fft.len() as f32).log(1.1f32) * 2f32 - 1f32, - x/255f32 + 0.5f32, *x/255f32] })
+                        .map(|(i, x)| Vertex { position: gen_vertex_quasar(fft.len(), i, *x) })
                         .collect::<Vec<Vertex>>()
                         .iter()
                         .cloned(),
@@ -323,6 +307,40 @@ pub fn window_loop(receiver: Receiver<Vec<f32>>) {
         }
     });
 }
+
+
+fn gen_vertex_flatvis(len: usize, i: usize, value: f32) -> [f32; 3] {
+    [(i as f32).log(1.1f32) / (len as f32).log(1.1f32) * 2f32 - 1f32,
+     - value/255f32 + 0.5f32,
+     value/255f32]
+}
+
+
+fn gen_vertex_quasar(len: usize, i: usize, value: f32) -> [f32; 3] {
+    let len = len as f32;
+    let i = i as f32;
+    //let (x, y) = ((i as f32).sin(), (i as f32).cos());
+    let circle_progress = i; //i.log2() * PI * 256f32;
+    let (x, y) = (i.sin(), i.cos());
+    [
+        x * i/len,
+        y * i/len,
+        (value/255f32).min(1f32).sqrt()
+    ]
+}
+
+
+fn gen_vertex_radial(len: usize, i: usize, value: f32) -> [f32; 3] {
+    let circle_progress = (i as f32).log2() * PI*2f32;
+    let (x, y) = (circle_progress.sin(), circle_progress.cos());
+    let log_factor = (i as f32).log(1.5f32) / (len as f32).log(1.5f32);
+    [
+        x * log_factor - x * value / 10000f32,
+        y * log_factor - y * value / 10000f32,
+        (value/255f32).min(1f32).sqrt()
+    ]
+}
+
 
 fn window_size_dependent_setup(
     images: &[Arc<SwapchainImage<Window>>],
