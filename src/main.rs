@@ -15,7 +15,7 @@ extern crate log;
 use simplelog::*;
 
 
-const UPPER_BOUND: usize = 4096*4;
+const UPPER_BOUND: usize = 4096*16;
 
 
 fn main() -> Res<()> {
@@ -108,14 +108,14 @@ fn fft_loop(raw: Receiver<Vec<u8>>, transformed: SyncSender<Vec<f32>>){
             Err(err) => error!("Some error {}", err),
         }
         
-        if frame_start + Duration::from_millis(20) < Instant::now() {
+        if frame_start + Duration::from_millis(6) < Instant::now() {
             frame_start = Instant::now();
             fft.process(&mut buffer);
             //print_bars(buffer.iter().map(|x| x.to_polar().0).collect::<Vec<f32>>());
             let mut half = buffer.iter().map(|x| x.to_polar().0).collect::<Vec<f32>>();
             half = half[0..half.len()/2].to_vec();
-            transformed.send(half);
-            print!("{:?}       ", Instant::now() - frame_start);
+            transformed.try_send(half).ok();
+            print!(" {:?} ", Instant::now() - frame_start);
         }
     }
 }

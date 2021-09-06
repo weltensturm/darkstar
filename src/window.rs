@@ -1,5 +1,6 @@
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver};
+use std::time::Duration;
 use vulkano::buffer::{BufferUsage, CpuAccessibleBuffer};
 use vulkano::command_buffer::{
     AutoCommandBufferBuilder, CommandBufferUsage, DynamicState, SubpassContents,
@@ -109,7 +110,7 @@ pub fn window_loop(receiver: Receiver<Vec<f32>>) {
 				void main() {
 					f_color = vec4(
                         min(position.z, 1),
-                        min(position.z*3 - 1, 1.0),
+                        min(position.z*3 - 1, position.z),
                         min(position.z*3 - 2, 1.0),
                         1.0);
 				}
@@ -144,6 +145,7 @@ pub fn window_loop(receiver: Receiver<Vec<f32>>) {
             .vertex_input_single_buffer()
             .vertex_shader(vs.main_entry_point(), ())
             .line_strip()
+            //.line_list()
             .viewports_dynamic_scissors_irrelevant(1)
             .fragment_shader(fs.main_entry_point(), ())
             .render_pass(Subpass::from(render_pass.clone(), 0).unwrap())
@@ -165,6 +167,7 @@ pub fn window_loop(receiver: Receiver<Vec<f32>>) {
     let mut recreate_swapchain = false;
 
     let mut previous_frame_end = Some(sync::now(device.clone()).boxed());
+    let mut window_size = [0, 0];
 
     event_loop.run(move |event, _, control_flow| {
         match event {
@@ -185,6 +188,7 @@ pub fn window_loop(receiver: Receiver<Vec<f32>>) {
 
                 if recreate_swapchain {
                     let dimensions: [u32; 2] = surface.window().inner_size().into();
+                    window_size = dimensions;
                     let (new_swapchain, new_images) =
                         match swapchain.recreate().dimensions(dimensions).build() {
                             Ok(r) => r,
@@ -215,16 +219,16 @@ pub fn window_loop(receiver: Receiver<Vec<f32>>) {
                     recreate_swapchain = true;
                 }
 
-                let fft: Vec<f32>;
-                match receiver.recv() {
+                let mut fft = vec![0f32; 512];
+                match receiver.recv_timeout(Duration::from_millis(20)) {
                     Ok(chunk) => {
                         fft = chunk;
                     }
-                    Err(err) => return,
+                    Err(err) => (),
                 }
-                let log_base = 1.015f32;
-                print!("{}", log_base);
                 
+                let aspect = window_size[0] as f32 / window_size[1] as f32;
+
                 let vertex_buffer = {
                     #[derive(Default, Debug, Clone)]
                     struct Vertex {
@@ -239,10 +243,8 @@ pub fn window_loop(receiver: Receiver<Vec<f32>>) {
                         fft
                         .iter()
                         .enumerate()
-                        //.map(|(i, x)| Vertex { position: [log_base.powi(i as i32) * 2f32 - 1f32, x/255f32] })
-                        //.map(|(i, x)| Vertex { position: [i as f32 / fft.len() as f32 * 2f32 - 1f32, - x/255f32 + 0.5f32] })
-                        //.map(|(i, x)| Vertex { position: [(i as f32).log(1.1f32) / (fft.len() as f32).log(1.1f32) * 2f32 - 1f32, - x/255f32 + 0.5f32, *x/255f32] })
-                        .map(|(i, x)| Vertex { position: gen_vertex_quasar(fft.len(), i, *x) })
+                        //.rev()
+                        .map(|(i, x)| Vertex { position: gen_vertex_quasar(aspect, fft.len(), i, *x) })
                         .collect::<Vec<Vertex>>()
                         .iter()
                         .cloned(),
@@ -316,16 +318,18 @@ fn gen_vertex_flatvis(len: usize, i: usize, value: f32) -> [f32; 3] {
 }
 
 
-fn gen_vertex_quasar(len: usize, i: usize, value: f32) -> [f32; 3] {
+fn gen_vertex_quasar(aspect: f32, len: usize, i: usize, value: f32) -> [f32; 3] {
     let len = len as f32;
     let i = i as f32;
+    let progress = i/len;
     //let (x, y) = ((i as f32).sin(), (i as f32).cos());
-    let circle_progress = i; //i.log2() * PI * 256f32;
-    let (x, y) = (i.sin(), i.cos());
+    // let circle_progress = i * 4f32;
+    let circle_progress = i * 4f32;
+    let (x, y) = (circle_progress.sin(), circle_progress.cos());
     [
-        x * i/len,
-        y * i/len,
-        (value/255f32).min(1f32).sqrt()
+        x / 25f32 + x * progress.powf(0.9f32) * 2.5f32,
+        (y / 25f32 + y * progress.powf(0.9f32) * 2.5f32) * aspect, // / 2f32,
+        (value/100f32).min(1f32).sqrt()
     ]
 }
 
