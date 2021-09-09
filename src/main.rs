@@ -59,7 +59,7 @@ fn main() -> Res<()> {
 }
 
 
-fn print_bars(buffer: Vec<f32>){
+fn _print_bars(buffer: Vec<f32>){
     let mut stdout = stdout();
     stdout.queue(cursor::Hide).map_err(|err| error!("{}", err)).ok();
     stdout.queue(cursor::MoveTo(0, 0)).map_err(|err| error!("{}", err)).ok();

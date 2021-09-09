@@ -273,12 +273,22 @@ pub fn window_loop(receiver: Receiver<Vec<f32>>) {
                 
                 let aspect = window_size[0] as f32 / window_size[1] as f32;
 
+                let proj_view = {
+                    let proj = cgmath::perspective(
+                        Rad(std::f32::consts::FRAC_PI_2),
+                        aspect,
+                        0.01,
+                        1.0,
+                    );
+                    let view = Matrix4::look_at_rh(
+                        Point3::new(0.0, 0.0, 30.0),
+                        Point3::new(50.0, 0.0, 0.0),
+                        Vector3::new(0.0, 0.0, 1.0),
+                    );
+                    proj * view
+                };
+            
                 let vertex_buffer = {
-                    #[derive(Default, Debug, Clone)]
-                    struct Vertex {
-                        position: [f32; 3],
-                        index: f32
-                    }
                     vulkano::impl_vertex!(Vertex, position, index);
                     
                     CpuAccessibleBuffer::from_iter(
@@ -289,7 +299,7 @@ pub fn window_loop(receiver: Receiver<Vec<f32>>) {
                         .iter()
                         .enumerate()
                         //.rev()
-                        .map(|(i, x)| Vertex { position: gen_vertex_quasar(circle_increment, aspect, fft.len(), i, *x), index: i as f32 })
+                        .map(|(i, x)| gen_vertex_quasar(proj_view, circle_increment, fft.len(), i, *x) )
                         .collect::<Vec<Vertex>>()
                         .iter()
                         .cloned(),
@@ -356,6 +366,13 @@ pub fn window_loop(receiver: Receiver<Vec<f32>>) {
 }
 
 
+#[derive(Default, Debug, Clone)]
+struct Vertex {
+    position: [f32; 3],
+    index: f32
+}
+
+
 fn gen_vertex_flatvis(len: usize, i: usize, value: f32) -> [f32; 3] {
     [(i as f32).log(1.1f32) / (len as f32).log(1.1f32) * 2f32 - 1f32,
      - value/255f32 + 0.5f32,
@@ -363,24 +380,10 @@ fn gen_vertex_flatvis(len: usize, i: usize, value: f32) -> [f32; 3] {
 }
 
 
-fn gen_vertex_quasar(circle_increment: f32, aspect: f32, len: usize, i: usize, value: f32) -> [f32; 3] {
+fn gen_vertex_quasar(proj_view: Matrix4::<f32>, circle_increment: f32, len: usize, i: usize, value: f32) -> Vertex {
     let len = len as f32;
     let i = i as f32;
     let progress = i/len;
-    //let (x, y) = ((i as f32).sin(), (i as f32).cos());
-    //let circle_progress = i * 4f32;
-
-    let proj = cgmath::perspective(
-        Rad(std::f32::consts::FRAC_PI_2),
-        aspect,
-        0.01,
-        1.0,
-    );
-    let view = Matrix4::look_at_rh(
-        Point3::new(0.0, 0.0, 30.0),
-        Point3::new(50.0, 0.0, 0.0),
-        Vector3::new(0.0, 0.0, 1.0),
-    );
 
     let circle_progress = i * PI*2f32 * (0.5f32 - 1f32 / 12f32 + 0.01f32 + circle_increment/2000.0);
     let (x, y) = (circle_progress.sin(), circle_progress.cos());
@@ -391,9 +394,12 @@ fn gen_vertex_quasar(circle_increment: f32, aspect: f32, len: usize, i: usize, v
         1f32
     ];
 
-    let mut result: [f32; 3] = ((proj * view) * Vector4::from(asdf)).truncate().into();
+    let mut result: [f32; 3] = (proj_view * Vector4::from(asdf)).truncate().into();
     result[2] = if i < 12f32 { 0f32 } else { (value/120f32).min(1f32).sqrt() };
-    result
+    Vertex {
+        position: result,
+        index: i
+    }
 }
 
 
