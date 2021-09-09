@@ -17,12 +17,13 @@ use vulkano::swapchain::{AcquireError, Swapchain, SwapchainCreationError};
 use vulkano::sync;
 use vulkano::sync::{FlushError, GpuFuture};
 use vulkano::Version;
-use winit::window::{Window, WindowBuilder};
+use winit::window::{Window, WindowBuilder, Fullscreen};
 use vulkano_win::VkSurfaceBuild;
-use winit::event::{Event, WindowEvent};
+use winit::event::{Event, WindowEvent, VirtualKeyCode, ElementState};
 use winit::event_loop::{ControlFlow, EventLoop};
 use winit::platform::windows::{WindowBuilderExtWindows};
 use std::f32::consts::PI;
+use cgmath::{ Vector3, Vector4, Point3, Matrix4, Rad };
 
 
 pub fn window_loop(receiver: Receiver<Vec<f32>>) {
@@ -39,6 +40,7 @@ pub fn window_loop(receiver: Receiver<Vec<f32>>) {
         physical.properties().device_type.unwrap(),
     );
     let event_loop = EventLoop::new();
+    
     let surface = WindowBuilder::new()
         .with_drag_and_drop(false) // otherwise conflicts with WASAPI
         .build_vk_surface(&event_loop, instance.clone())
@@ -65,11 +67,14 @@ pub fn window_loop(receiver: Receiver<Vec<f32>>) {
 
     let queue = queues.next().unwrap();
 
+    let mut window_size = [0, 0];
+
     let (mut swapchain, images) = {
         let caps = surface.capabilities(physical).unwrap();
         let composite_alpha = caps.supported_composite_alpha.iter().next().unwrap();
         let format = caps.supported_formats[0].0;
         let dimensions: [u32; 2] = surface.window().inner_size().into();
+        window_size = dimensions;
         Swapchain::start(device.clone(), surface.clone())
             .num_images(caps.min_image_count)
             .format(format)
@@ -88,10 +93,11 @@ pub fn window_loop(receiver: Receiver<Vec<f32>>) {
 				#version 450
 
 				layout(location = 0) in vec3 position;
+                layout(location = 1) in float index;
                 layout(location = 0) out vec4 out_position;
 
 				void main() {
-                    out_position = vec4(position, 1.0); 
+                    out_position = vec4(position, index); 
 					gl_Position = vec4(position, 1.0);
 				}
 			"
@@ -108,11 +114,20 @@ pub fn window_loop(receiver: Receiver<Vec<f32>>) {
 				layout(location = 0) out vec4 f_color;
 
 				void main() {
+                    float center = max(
+                                       max(
+                                            1 - abs(position.w - floor(position.w) - 0.55) * 2,
+                                            0
+                                       )
+                                       * 3 - 2,
+                                       0
+                                    );
 					f_color = vec4(
-                        min(position.z, 1),
+                        min(position.z*2 * center, 1),
                         min(position.z*3 - 1, position.z),
                         min(position.z*3 - 2, 1.0),
-                        1.0);
+                        sqrt(min(position.z, 1) * center)
+                    );
 				}
 			"
         }
@@ -142,6 +157,8 @@ pub fn window_loop(receiver: Receiver<Vec<f32>>) {
 
     let pipeline = Arc::new(
         GraphicsPipeline::start()
+            .blend_alpha_blending()
+            .line_width(2f32)
             .vertex_input_single_buffer()
             .vertex_shader(vs.main_entry_point(), ())
             .line_strip()
@@ -167,21 +184,49 @@ pub fn window_loop(receiver: Receiver<Vec<f32>>) {
     let mut recreate_swapchain = false;
 
     let mut previous_frame_end = Some(sync::now(device.clone()).boxed());
-    let mut window_size = [0, 0];
+
+    let mut fft = vec![0f32; 512];
+    let mut circle_increment = 0f32;
 
     event_loop.run(move |event, _, control_flow| {
         match event {
-            Event::WindowEvent {
-                event: WindowEvent::CloseRequested,
-                ..
-            } => {
-                *control_flow = ControlFlow::Exit;
-            }
-            Event::WindowEvent {
-                event: WindowEvent::Resized(_),
-                ..
-            } => {
-                recreate_swapchain = true;
+            Event::WindowEvent { event, .. } => match event {
+
+                WindowEvent::CloseRequested => {
+                    *control_flow = ControlFlow::Exit;
+                }
+
+                WindowEvent::Resized(_) => {
+                    recreate_swapchain = true;
+                }
+
+                WindowEvent::MouseWheel { delta, .. } => match delta {
+                    winit::event::MouseScrollDelta::LineDelta(x, y) => {
+                        circle_increment += y as f32 / 10f32;
+                        println!("({})", circle_increment);
+                    }
+                    winit::event::MouseScrollDelta::PixelDelta(p) => {
+                        circle_increment += p.y as f32 / 100f32;
+                        println!("({})", circle_increment);
+                    },
+                    _ => ()
+                },
+
+                WindowEvent::KeyboardInput { input, .. } => match (input.state, input.virtual_keycode) {
+                    (ElementState::Released, Some(VirtualKeyCode::F11)) => {
+                        match surface.window().fullscreen() {
+                            Some(_) => surface.window().set_fullscreen(None),
+                            None => surface.window().set_fullscreen(Some(Fullscreen::Borderless(None)))
+                        }
+                    },
+                    (ElementState::Released, Some(VirtualKeyCode::Escape)) => {
+                        surface.window().set_fullscreen(None)
+                    }
+                    _ => ()
+                }
+
+                _ => ()
+
             }
             Event::RedrawEventsCleared => {
                 previous_frame_end.as_mut().unwrap().cleanup_finished();
@@ -219,7 +264,6 @@ pub fn window_loop(receiver: Receiver<Vec<f32>>) {
                     recreate_swapchain = true;
                 }
 
-                let mut fft = vec![0f32; 512];
                 match receiver.recv_timeout(Duration::from_millis(20)) {
                     Ok(chunk) => {
                         fft = chunk;
@@ -233,8 +277,9 @@ pub fn window_loop(receiver: Receiver<Vec<f32>>) {
                     #[derive(Default, Debug, Clone)]
                     struct Vertex {
                         position: [f32; 3],
+                        index: f32
                     }
-                    vulkano::impl_vertex!(Vertex, position);
+                    vulkano::impl_vertex!(Vertex, position, index);
                     
                     CpuAccessibleBuffer::from_iter(
                         device.clone(),
@@ -244,7 +289,7 @@ pub fn window_loop(receiver: Receiver<Vec<f32>>) {
                         .iter()
                         .enumerate()
                         //.rev()
-                        .map(|(i, x)| Vertex { position: gen_vertex_quasar(aspect, fft.len(), i, *x) })
+                        .map(|(i, x)| Vertex { position: gen_vertex_quasar(circle_increment, aspect, fft.len(), i, *x), index: i as f32 })
                         .collect::<Vec<Vertex>>()
                         .iter()
                         .cloned(),
@@ -318,30 +363,48 @@ fn gen_vertex_flatvis(len: usize, i: usize, value: f32) -> [f32; 3] {
 }
 
 
-fn gen_vertex_quasar(aspect: f32, len: usize, i: usize, value: f32) -> [f32; 3] {
+fn gen_vertex_quasar(circle_increment: f32, aspect: f32, len: usize, i: usize, value: f32) -> [f32; 3] {
     let len = len as f32;
     let i = i as f32;
     let progress = i/len;
     //let (x, y) = ((i as f32).sin(), (i as f32).cos());
-    // let circle_progress = i * 4f32;
-    let circle_progress = i * 4f32;
+    //let circle_progress = i * 4f32;
+
+    let proj = cgmath::perspective(
+        Rad(std::f32::consts::FRAC_PI_2),
+        aspect,
+        0.01,
+        1.0,
+    );
+    let view = Matrix4::look_at_rh(
+        Point3::new(0.0, 0.0, 30.0),
+        Point3::new(50.0, 0.0, 0.0),
+        Vector3::new(0.0, 0.0, 1.0),
+    );
+
+    let circle_progress = i * PI*2f32 * (0.5f32 - 1f32 / 12f32 + 0.01f32 + circle_increment/2000.0);
     let (x, y) = (circle_progress.sin(), circle_progress.cos());
-    [
-        x / 25f32 + x * progress.powf(0.9f32) * 2.5f32,
-        (y / 25f32 + y * progress.powf(0.9f32) * 2.5f32) * aspect, // / 2f32,
-        (value/100f32).min(1f32).sqrt()
-    ]
+    let asdf = [
+        x / 10f32 + x * progress.powf(0.9f32) * (10f32) + 50.0,
+        y / 10f32 + y * progress.powf(0.9f32) * (10f32),
+        0.0, // (i/len).powf(1.1f32) * ((i % 2.0) as f32 * 2.0 - 1.0),
+        1f32
+    ];
+
+    let mut result: [f32; 3] = ((proj * view) * Vector4::from(asdf)).truncate().into();
+    result[2] = if i < 12f32 { 0f32 } else { (value/120f32).min(1f32).sqrt() };
+    result
 }
 
 
-fn gen_vertex_radial(len: usize, i: usize, value: f32) -> [f32; 3] {
+fn gen_vertex_radial(circle_increment: f32, aspect: f32, len: usize, i: usize, value: f32) -> [f32; 3] {
     let circle_progress = (i as f32).log2() * PI*2f32;
     let (x, y) = (circle_progress.sin(), circle_progress.cos());
     let log_factor = (i as f32).log(1.5f32) / (len as f32).log(1.5f32);
     [
-        x * log_factor - x * value / 10000f32,
-        y * log_factor - y * value / 10000f32,
-        (value/255f32).min(1f32).sqrt()
+        x * log_factor - x,
+        y * log_factor - y,
+        (value/100f32).min(1f32).sqrt()
     ]
 }
 
