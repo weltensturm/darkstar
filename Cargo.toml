@@ -4,14 +4,24 @@ version = "0.0.1"
 edition = "2018"
 
 [dependencies]
-wasapi = "0.4.1"
 log = "^0.4.0"
 simplelog = "^0.10.0"
 rustfft = "^6.0.1"
 terminal_size = "^0.1.17"
 crossterm = "^0.21.0"
-vulkano = "0.24.0"
-vulkano-shaders = "0.24.0"
-vulkano-win = "0.24.0"
-winit = "0.25"
+vulkano = "=0.32.0"
+vulkano-shaders = "=0.32.0"
+vulkano-win = "=0.32.0"
+bytemuck = { version = "1.7", features = ["derive", "extern_crate_std", "min_const_generics"] }
+winit = "0.27"
 cgmath = "0.18.0"
+
+[target.'cfg(windows)'.dependencies]
+wasapi = "0.4.1"
+
+
+[target.'cfg(windows)'.dependencies.windows]
+version = "0.44.0"
+features = [
+    "Win32_System_Power"
+]
