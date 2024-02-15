@@ -1,9 +1,15 @@
+use core::panic;
 use std::sync::Arc;
-use std::sync::mpsc::{Receiver};
-use std::time::Duration;
+use std::sync::mpsc::{SyncSender, Receiver};
+use std::time::{Duration, SystemTime};
 
+use std::fs::read_to_string;
+use std::io::Read;
+use std::error;
 
 use bytemuck::{Pod, Zeroable};
+use vulkano::pipeline::graphics::rasterization::{RasterizationState, LineRasterizationMode};
+use vulkano::pipeline::StateMode;
 use vulkano::{
     buffer::{BufferUsage, CpuAccessibleBuffer, TypedBufferAccess},
     command_buffer::{
@@ -19,16 +25,19 @@ use vulkano::{
     memory::allocator::StandardMemoryAllocator,
     pipeline::{
         graphics::{
-            input_assembly::InputAssemblyState,
+            input_assembly::{InputAssemblyState, PrimitiveTopology},
+            color_blend::ColorBlendState,
             vertex_input::BuffersDefinition,
             viewport::{Viewport, ViewportState},
         },
         GraphicsPipeline,
     },
     render_pass::{Framebuffer, FramebufferCreateInfo, RenderPass, Subpass},
+    shader::ShaderModule,
     swapchain::{
         acquire_next_image, AcquireError, Swapchain, SwapchainCreateInfo, SwapchainCreationError,
         SwapchainPresentInfo,
+        ColorSpace::{SrgbNonLinear, Hdr10St2084, Hdr10Hlg}
     },
     sync::{self, FlushError, GpuFuture},
     VulkanLibrary,
@@ -39,16 +48,50 @@ use vulkano_win::VkSurfaceBuild;
 use winit::event::{Event, WindowEvent, VirtualKeyCode, ElementState};
 use winit::event_loop::{ControlFlow, EventLoop};
 #[cfg(target_os = "windows")] use winit::platform::windows::{WindowBuilderExtWindows};
-use std::f32::consts::PI;
+use std::f32::consts::{PI, E};
 use cgmath::{ Vector3, Vector4, Point3, Matrix4, Rad };
 use std::convert::TryFrom;
 use std::time::Instant;
 
 
-pub fn window_loop(receiver: Receiver<Vec<f32>>) {
+use crate::FFT_RESULT_SIZE;
+use crate::capture::CaptureCommand;
+
+
+enum RenderMode {
+    Quasar,
+    Line,
+    Circle,
+}
+
+impl RenderMode {
+    fn next(&self) -> Self {
+        use RenderMode::*;
+        match *self {
+            Quasar => Line,
+            Line => Circle,
+            Circle => Quasar,
+        }
+    }
+}
+
+
+struct VertexParams {
+    mode: RenderMode,
+    multiplier: f32,
+    exponent: f32
+}
+
+
+pub fn window_loop(receiver: Receiver<Vec<f32>>, capture_command: SyncSender<CaptureCommand>) -> Result<(), Box<dyn error::Error>> {
     
-    let library = VulkanLibrary::new().expect("no local Vulkan library/DLL");
-    let required_extensions = vulkano_win::required_extensions(&library);
+    let colorspace = Hdr10St2084;
+
+    let library = VulkanLibrary::new().expect("Vulkan");
+    let required_extensions = vulkano::instance::InstanceExtensions {
+        ext_swapchain_colorspace: true,
+        ..vulkano_win::required_extensions(&library)
+    };
     let instance = Instance::new(
         library,
         InstanceCreateInfo {
@@ -82,49 +125,19 @@ pub fn window_loop(receiver: Receiver<Vec<f32>>) {
         .enumerate_physical_devices()
         .unwrap()
         .filter(|p| {
-            // Some devices may not support the extensions or features that your application, or
-            // report properties and limits that are not sufficient for your application. These
-            // should be filtered out here.
             p.supported_extensions().contains(&device_extensions)
         })
         .filter_map(|p| {
-            // For each physical device, we try to find a suitable queue family that will execute
-            // our draw commands.
-            //
-            // Devices can provide multiple queues to run commands in parallel (for example a draw
-            // queue and a compute queue), similar to CPU threads. This is something you have to
-            // have to manage manually in Vulkan. Queues of the same type belong to the same
-            // queue family.
-            //
-            // Here, we look for a single queue family that is suitable for our purposes. In a
-            // real-life application, you may want to use a separate dedicated transfer queue to
-            // handle data transfers in parallel with graphics operations. You may also need a
-            // separate queue for compute operations, if your application uses those.
             p.queue_family_properties()
                 .iter()
                 .enumerate()
                 .position(|(i, q)| {
-                    // We select a queue family that supports graphics operations. When drawing to
-                    // a window surface, as we do in this example, we also need to check that queues
-                    // in this queue family are capable of presenting images to the surface.
                     q.queue_flags.graphics && p.surface_support(i as u32, &surface).unwrap_or(false)
                     && p.supported_features().contains(&enabled_features)
                 })
-                // The code here searches for the first queue family that is suitable. If none is
-                // found, `None` is returned to `filter_map`, which disqualifies this physical
-                // device.
                 .map(|i| (p, i as u32))
         })
-        // All the physical devices that pass the filters above are suitable for the application.
-        // However, not every device is equal, some are preferred over others. Now, we assign
-        // each physical device a score, and pick the device with the
-        // lowest ("best") score.
-        //
-        // In this example, we simply select the best-scoring device to use in the application.
-        // In a real-life setting, you may want to use the best-scoring device only as a
-        // "default" or "recommended" device, and let the user choose the device themselves.
         .min_by_key(|(p, _)| {
-            // We assign a lower score to device types that are likely to be faster/better.
             match p.properties().device_type {
                 PhysicalDeviceType::DiscreteGpu => 0,
                 PhysicalDeviceType::IntegratedGpu => 1,
@@ -146,15 +159,8 @@ pub fn window_loop(receiver: Receiver<Vec<f32>>) {
         // Which physical device to connect to.
         physical_device,
         DeviceCreateInfo {
-            // A list of optional features and extensions that our program needs to work correctly.
-            // Some parts of the Vulkan specs are optional and must be enabled manually at device
-            // creation. In this example the only thing we are going to need is the `khr_swapchain`
-            // extension that allows us to draw to a window.
             enabled_extensions: device_extensions,
             enabled_features: enabled_features,
-
-            // The list of queues that we are going to use. Here we only use one queue, from the
-            // previously chosen queue family.
             queue_create_infos: vec![QueueCreateInfo {
                 queue_family_index,
                 ..Default::default()
@@ -183,6 +189,22 @@ pub fn window_loop(receiver: Receiver<Vec<f32>>) {
                 .unwrap()[0]
                 .0,
         );
+
+        let image_format = {
+            match
+                device
+                    .physical_device()
+                    .surface_formats(&surface, Default::default())
+                    .unwrap()
+                    .into_iter()
+                    .filter(|a| a.1 == colorspace)
+                    .next()
+            {
+                Some(f) => Some(f.0),
+                None => panic!("Surface not supported")
+            }
+        };
+
         let window = surface.object().unwrap().downcast_ref::<Window>().unwrap();
         window.set_cursor_visible(false);
         window_size = window.inner_size().into();
@@ -193,6 +215,7 @@ pub fn window_loop(receiver: Receiver<Vec<f32>>) {
             SwapchainCreateInfo {
                 min_image_count: surface_capabilities.min_image_count,
                 image_format,
+                image_color_space: colorspace,
                 image_extent: window_size,
                 image_usage: ImageUsage {
                     color_attachment: true,
@@ -202,66 +225,28 @@ pub fn window_loop(receiver: Receiver<Vec<f32>>) {
                 ..Default::default()
             },
         )
-        .unwrap()
+        .expect("swapchain")
     };
 
-    mod vs {
-        vulkano_shaders::shader! {
-            ty: "vertex",
-            src: "
-				#version 450
+    let vs = {
+        let file = read_to_string("shaders/16lines.vs").expect("16lines.vs");
 
-				layout(location = 0) in vec3 position;
-                layout(location = 1) in float intensity;
-                layout(location = 2) in float index;
-                layout(location = 0) out float f_intensity;
-                layout(location = 1) out float f_index;
+        let mut spirv = glsl_to_spirv::compile(&file, glsl_to_spirv::ShaderType::Vertex)?;
+        let mut spirv_bytes = vec![];
+        spirv.read_to_end(&mut spirv_bytes)?;    
 
-				void main() {
-                    f_intensity = intensity;
-                    f_index = index;
-					gl_Position = vec4(position, 1.0);
-				}
-			"
-        }
-    }
+        unsafe { ShaderModule::from_bytes(device.clone(), &spirv_bytes) }?
+    };
 
-    mod fs {
-        vulkano_shaders::shader! {
-            ty: "fragment",
-            src: "
-				#version 450
+    let fs = {
+        let file = read_to_string("shaders/16lines.fs").expect("16lines.fs");
 
-                layout(location = 0) in float f_intensity;
-                layout(location = 1) in float f_index;
-				layout(location = 0) out vec4 f_color;
+        let mut spirv = glsl_to_spirv::compile(&file, glsl_to_spirv::ShaderType::Fragment)?;
+        let mut spirv_bytes = vec![];
+        spirv.read_to_end(&mut spirv_bytes)?;    
 
-				void main() {
-                    float distance_to_center = pow(250/max(f_index, 1), 0.2);
-                    float distance_to_center_white = pow(250/max(f_index, 1), 0.2);
-                    float center = max(
-                                       max(
-                                            1 - abs(f_index - floor(f_index) - 0.545) * 2,
-                                            0
-                                       )
-                                       * (1/distance_to_center*10+1) - (1/distance_to_center*10 - 1),
-                                       0
-                                    )
-                                    * pow(f_intensity, 0.4)
-                                    ;
-					f_color = vec4(
-                        min(pow(f_intensity, 0.75)/distance_to_center*2, 1),
-                        min(f_intensity/distance_to_center*3 - 1, f_intensity/distance_to_center*2),
-                        min(f_intensity*f_intensity/distance_to_center*3 - 2, 1.0),
-                        min(f_intensity/distance_to_center, 1) * center * 0.95
-                    );
-				}
-			"
-        }
-    }
-
-    let vs = vs::load(device.clone()).unwrap();
-    let fs = fs::load(device.clone()).unwrap();
+        unsafe { ShaderModule::from_bytes(device.clone(), &spirv_bytes) }?
+    };
 
     let render_pass = vulkano::single_pass_renderpass!(
         device.clone(),
@@ -281,13 +266,18 @@ pub fn window_loop(receiver: Receiver<Vec<f32>>) {
     .unwrap();
 
     let pipeline = GraphicsPipeline::start()
-            .blend_alpha_blending()
-            .line_width(3f32)
+            // .blend_alpha_blending()
+            .rasterization_state(RasterizationState {
+                line_width: StateMode::Fixed(4f32),
+                ..Default::default()
+            })
+            // .color_blend_state(ColorBlendState::new(1).blend_alpha())
+            .color_blend_state(ColorBlendState::new(1).blend_additive())
             .vertex_input_state(BuffersDefinition::new().vertex::<Vertex>())
             .vertex_shader(vs.entry_point("main").unwrap(), ())
-            .line_strip()
-            //.line_list()
-            .viewports_dynamic_scissors_irrelevant(1)
+            .input_assembly_state(InputAssemblyState::new().topology(PrimitiveTopology::LineStrip))
+            // .input_assembly_state(InputAssemblyState::new().topology(PrimitiveTopology::LineList))
+            .viewport_state(ViewportState::viewport_dynamic_scissor_irrelevant())
             .fragment_shader(fs.entry_point("main").unwrap(), ())
             .render_pass(Subpass::from(render_pass.clone(), 0).unwrap())
             .build(device.clone())
@@ -310,8 +300,19 @@ pub fn window_loop(receiver: Receiver<Vec<f32>>) {
     let mut previous_frame_end = Some(sync::now(device.clone()).boxed());
 
     let mut fft = vec![0f32; 512];
-    let mut circle_increment = -20.70003f32;
+    let mut circle = VertexParams {
+        mode: RenderMode::Quasar,
+        // multiplier: 1.0023009,
+        // multiplier: 1.0034024,
+        multiplier: 0.98540187,
+        exponent: 1f32
+    };
     // -138.29922
+
+    let mut in_shift = false;
+    let mut in_ctrl = false;
+
+    let mut last_cursor_moved = SystemTime::now();
 
     event_loop.run(move |event, _, control_flow| {
         let window = surface.object().unwrap().downcast_ref::<Window>().unwrap();
@@ -326,16 +327,25 @@ pub fn window_loop(receiver: Receiver<Vec<f32>>) {
                     recreate_swapchain = true;
                 }
 
+                WindowEvent::CursorMoved { device_id, position, .. } => {
+                    window.set_cursor_visible(true);
+                    last_cursor_moved = SystemTime::now();
+                }
+
                 WindowEvent::MouseWheel { delta, .. } => match delta {
-                    winit::event::MouseScrollDelta::LineDelta(x, y) => {
-                        circle_increment += y as f32 / 10f32;
-                        println!("({})", circle_increment);
-                    }
-                    winit::event::MouseScrollDelta::PixelDelta(p) => {
-                        circle_increment += p.y as f32 / 100f32;
-                        println!("({})", circle_increment);
+                    winit::event::MouseScrollDelta::LineDelta(_x, y) => {
+                        if in_ctrl {
+                            circle.exponent += y as f32 / (if in_shift { 1000.0 } else { 100.0 });
+                            println!("({})", circle.exponent);
+                        } else {
+                            circle.multiplier += y as f32 / (if in_shift { 40000.0 } else { 2000.0});
+                            println!("({})", circle.multiplier);
+                        }
                     },
-                    _ => ()
+                    winit::event::MouseScrollDelta::PixelDelta(p) => {
+                        circle.exponent += p.y as f32 / 100f32;
+                        println!("({})", circle.exponent);
+                    }
                 },
 
                 WindowEvent::KeyboardInput { input, .. } => match (input.state, input.virtual_keycode) {
@@ -347,7 +357,19 @@ pub fn window_loop(receiver: Receiver<Vec<f32>>) {
                     },
                     (ElementState::Released, Some(VirtualKeyCode::Escape)) => {
                         window.set_fullscreen(None)
+                    },
+                    (ElementState::Released, Some(VirtualKeyCode::T)) => {
+                        circle.mode = circle.mode.next();
+                    },
+                    (ElementState::Released, Some(VirtualKeyCode::Space)) => {
+                        capture_command.send(CaptureCommand::SwitchCaptureType).unwrap();
                     }
+                    (state, Some(VirtualKeyCode::LShift)) => {
+                        in_shift = state == ElementState::Pressed;
+                    },
+                    (state, Some(VirtualKeyCode::LControl)) => {
+                        in_ctrl = state == ElementState::Pressed;
+                    },
                     _ => ()
                 }
 
@@ -355,6 +377,11 @@ pub fn window_loop(receiver: Receiver<Vec<f32>>) {
 
             }
             Event::RedrawEventsCleared => {
+                if last_cursor_moved != SystemTime::UNIX_EPOCH && last_cursor_moved + Duration::from_secs(2) < SystemTime::now() {
+                    last_cursor_moved = SystemTime::UNIX_EPOCH;
+                    window.set_cursor_visible(false);
+                }
+
                 previous_frame_end.as_mut().unwrap().cleanup_finished();
 
                 let dimensions = window.inner_size();
@@ -427,7 +454,7 @@ pub fn window_loop(receiver: Receiver<Vec<f32>>) {
                 };
             
                 let vertex_buffer = {
-                    vulkano::impl_vertex!(Vertex, position, intensity, index);
+                    vulkano::impl_vertex!(Vertex, position, intensity, index, mode);
                     
                     CpuAccessibleBuffer::from_iter(
                         &memory_allocator,
@@ -439,11 +466,8 @@ pub fn window_loop(receiver: Receiver<Vec<f32>>) {
                         fft
                             .iter()
                             .enumerate()
-                            //.rev()
-                            .map(|(i, x)| gen_vertex_quasar(proj_view, circle_increment, fft.len(), i, *x) )
-                            .collect::<Vec<Vertex>>()
-                            .iter()
-                            .cloned(),
+                            .map(|(i, x)| gen_vertex(proj_view, &circle, fft.len(), i, *x) )
+                            .collect::<Vec<Vertex>>(),
                     )
                     .unwrap()
                 };            
@@ -468,6 +492,7 @@ pub fn window_loop(receiver: Receiver<Vec<f32>>) {
                     .unwrap()
                     .set_viewport(0, [viewport.clone()])
                     .bind_pipeline_graphics(pipeline.clone())
+                    // .set_line_width(dimensions.width as f32 / 2560.0)
                     .bind_vertex_buffers(0, vertex_buffer.clone())
                     .draw(vertex_buffer.len() as u32, 1, 0, 0)
                     .unwrap()
@@ -513,7 +538,8 @@ pub fn window_loop(receiver: Receiver<Vec<f32>>) {
 struct Vertex {
     position: [f32; 3],
     intensity: f32,
-    index: f32
+    index: f32,
+    mode: i32,
 }
 
 
@@ -524,27 +550,88 @@ fn gen_vertex_flatvis(len: usize, i: usize, value: f32) -> [f32; 3] {
 }
 
 
-fn gen_vertex_quasar(proj_view: Matrix4::<f32>, circle_increment: f32, len: usize, i: usize, value: f32) -> Vertex {
+fn gen_vertex(proj_view: Matrix4::<f32>, circle: &VertexParams, len: usize, i: usize, value: f32) -> Vertex {
     let len = len as f32;
     let i = i as f32;
     let progress = i/len;
 
-    let circle_progress = i * PI*2f32 * (0.5f32 - 1f32 / 12f32 + 0.01f32 + circle_increment/2000.0);
-    let (x, y) = (circle_progress.sin(), circle_progress.cos());
-    let asdf = [
-        x / 10f32 + x * progress.powf(0.8f32) * (10f32) + 50.0,
-        y / 10f32 + y * progress.powf(0.8f32) * (10f32),
-        0.0, // (i/len).powf(1.1f32) * ((i % 2.0) as f32 * 2.0 - 1.0),
-        1f32
-    ];
+    match circle.mode {
+        RenderMode::Circle => {
+            let value = value*(i/len).sqrt();
+            // let circle_progress = i.powf(1.0/(circle.exponent/20.0)) * PI*2f32 * 85.0/2000.0 * circle.multiplier;
+            let circle_progress = (progress.powf(circle.exponent) * PI*2f32 * circle.multiplier)*len;
+            // let (y, x) = (1f32/(1f32+i/len).log(2f32) + circle_increment/20.0, -value/50f32);
+            let (x, y) = (circle_progress.sin(), circle_progress.cos());
+            let flipflop = 1f32 - (i % 2f32)*2f32;
+            let expand = (value/50.0).powf(2f32) * flipflop / (10.0 + progress.powf(0.8f32));
+            let asdf = [
+                x / 10f32 + x * expand + x * progress.powf(0.8f32) * (1.5f32) + 50.0,
+                y / 10f32 + y * expand + y * progress.powf(0.8f32) * (1.5f32),
+                0f32, // -value / 1000.0 * (1f32 - (i % 2f32)*2f32),
+                1f32
+            ];
 
-    let mut result: [f32; 3] = (proj_view * Vector4::from(asdf)).truncate().into();
-    // result[2] = 0f32; //if i < 12f32 { 0f32 } else { (value/60f32).min(1f32) };
-    result[2] = if i < 12f32 { 0f32 } else { (value/60f32).min(1f32) };
-    Vertex {
-        position: result,
-        intensity: if i < 12f32 { 0f32 } else { (value/50f32).powf(0.95f32).min(1f32) },
-        index: i
+            let mut result: [f32; 3] = (proj_view * Vector4::from(asdf)).truncate().into();
+            result[2] = 0f32; //if i < 12f32 { 0f32 } else { (value/60f32).min(1f32) };
+            // result[2] = value/60f32;
+            Vertex {
+                position: result,
+                intensity:
+                    if i % 440f32 < 4f32
+                        { 1f32 }
+                        else { (value/2.0).powf(0.95f32).min(1f32) },
+                index: i,
+                mode: 0,
+            }
+        }
+        RenderMode::Quasar => {
+            let circle_progress = i * PI*2f32 * (0.5f32 - 1f32 / 12f32 + 0.01f32 + (-20.70003f32*circle.multiplier)/2000.0);
+            let (x, y) = (circle_progress.sin(), circle_progress.cos());
+            let asdf = [
+                x / 10f32 + x * progress.powf(0.8f32) * (10f32) + 50.0,
+                y / 10f32 + y * progress.powf(0.8f32) * (10f32),
+                0.0, // (i/len).powf(1.1f32) * ((i % 2.0) as f32 * 2.0 - 1.0),
+                1f32
+            ];
+        
+            let mut result: [f32; 3] = (proj_view * Vector4::from(asdf)).truncate().into();
+            // result[2] = 0f32; //if i < 12f32 { 0f32 } else { (value/60f32).min(1f32) };
+            result[2] = if i < 12f32 { 0f32 } else { (value/60f32).min(1f32) };
+            Vertex {
+                position: result,
+                intensity: if i < 12f32 { 0f32 } else { (value/40f32).powf(0.95f32).min(1f32) },
+                index: i,
+                mode: 1,
+            }
+        }
+        RenderMode::Line => {
+            // let value = value*(i/len).sqrt();
+            let (x, y) = (
+                -value/50.0,
+                // progress.powf(circle.exponent)*circle.multiplier*2.0
+                2595.0 * (i * 0.005).log10() / 4000.0
+            );
+
+            let flipflop = 1f32; //1f32 - (i % 2f32)*2f32;
+
+            let vec = [
+                1.0 + x * (1.5f32) * flipflop + 50.0,
+                1.0 - y * (1.5f32),
+                0f32, // -value / 1000.0 * (1f32 - (i % 2f32)*2f32),
+                1f32
+            ];
+            let mut result: [f32; 3] = (proj_view * Vector4::from(vec)).truncate().into();
+            result[2] = 0f32; //if i < 12f32 { 0f32 } else { (value/60f32).min(1f32) };
+            Vertex {
+                position: result,
+                intensity:
+                    if i % 440f32 < 4f32
+                        { 1f32 }
+                        else { (value/4.0).powf(0.95f32).min(1f32) },
+                index: i,
+                mode: 0,
+            }
+        }
     }
 }
 

@@ -5,7 +5,6 @@ use std::sync::mpsc::{SyncSender, Receiver, sync_channel, TryRecvError};
 use std::thread::sleep;
 use core::time::Duration;
 
-// use wasapi::*;
 
 use cpal::{
     StreamError,
@@ -13,77 +12,8 @@ use cpal::{
     traits::{HostTrait, DeviceTrait, StreamTrait}
 };
 
-// use windows::core::Error as WindowsError;
-// use windows::Win32::System::Power::{
-//     SetThreadExecutionState, ES_CONTINUOUS, ES_DISPLAY_REQUIRED, EXECUTION_STATE,
-// };
 
 type Res<T> = Result<T, Box<dyn error::Error>>;
-
-
-// pub fn capture_loop_old(tx_capt: SyncSender<(usize, Vec<f32>)>, chunksize: usize) -> Res<()> {
-
-//     initialize_mta()?;
-
-//     unsafe {
-//         let flags = ES_CONTINUOUS | ES_DISPLAY_REQUIRED;
-//         if SetThreadExecutionState(flags) == EXECUTION_STATE(0) {
-//             return Err(Box::new(WindowsError::from_win32()));
-//         }
-//     }
-
-//     loop {
-//         let device = get_default_device(&Direction::Render)?;
-//         println!("Using audio device: {}", device.get_friendlyname().unwrap());
-//         let mut audio_client = device.get_iaudioclient()?;
-
-//         let channels = 1;
-
-//         let desired_format = WaveFormat::new(32, 32, &SampleType::Float, 44100, channels);
-
-//         let blockalign = desired_format.get_blockalign();
-
-//         let (_def_time, min_time) = audio_client.get_periods()?;
-
-//         audio_client.initialize_client(
-//             &desired_format,
-//             min_time as i64,
-//             &Direction::Capture,
-//             &ShareMode::Shared,
-//             true,
-//         )?;
-
-//         let h_event = audio_client.set_get_eventhandle()?;
-
-//         let buffer_frame_count = audio_client.get_bufferframecount()?;
-
-//         let render_client = audio_client.get_audiocaptureclient()?;
-//         let mut sample_queue: VecDeque<u8> = VecDeque::with_capacity(
-//             channels * blockalign as usize * buffer_frame_count as usize,
-//         );
-//         audio_client.start_stream()?;
-//         loop {
-//             if let Err(msg) = h_event.wait_for_event(1000) {
-//                 eprintln!("{}", msg);
-//                 audio_client.stop_stream()?;
-//                 break;
-//             }
-//             while sample_queue.len() > chunksize {
-//                 let mut chunk = vec![0u8; chunksize];
-//                 for element in chunk.iter_mut() {
-//                     *element = sample_queue.pop_front().unwrap();
-//                 }
-//                 let floats = unsafe {
-//                     let (_, floats_tmp, _) = chunk.align_to::<f32>();
-//                     floats_tmp.to_vec()
-//                 };
-//                 tx_capt.send((desired_format.get_samplespersec() as usize, floats))?;
-//             }
-//             render_client.read_from_device_to_deque(blockalign as usize, &mut sample_queue)?;
-//         }
-//     }
-//     Ok(())
-// }
 
 
 enum Op {
@@ -112,7 +42,7 @@ impl CaptureType {
 }
 
 
-pub fn capture_loop(to_fft: SyncSender<(usize, Vec<f32>)>, commands: Receiver::<CaptureCommand>) -> Res<()> {
+pub fn capture_loop(to_fft: SyncSender<(usize, u16, Vec<f32>)>, commands: Receiver::<CaptureCommand>) -> Res<()> {
     let host = cpal::default_host();
 
     let mut capture_type = CaptureType::Output;
@@ -121,8 +51,6 @@ pub fn capture_loop(to_fft: SyncSender<(usize, Vec<f32>)>, commands: Receiver::<
 
         let (device, config) = match capture_type {
             CaptureType::Input => {
-
-                println!("{}", host.input_devices().unwrap().map(|a| a.name().unwrap() ).collect::<Vec<String>>().join("\n"));
 
                 let device = host.default_input_device().unwrap();
         
@@ -138,8 +66,6 @@ pub fn capture_loop(to_fft: SyncSender<(usize, Vec<f32>)>, commands: Receiver::<
             }
             CaptureType::Output => {
 
-                println!("{}", host.output_devices().unwrap().map(|a| a.name().unwrap() ).collect::<Vec<String>>().join("\n"));
-
                 let device = host.default_output_device().unwrap();
         
                 let mut supported_configs = device.supported_output_configs().unwrap();
@@ -154,18 +80,21 @@ pub fn capture_loop(to_fft: SyncSender<(usize, Vec<f32>)>, commands: Receiver::<
         };
 
         let target_sample_rate = 30000;
-        let mut sample_reduction: usize = 1;
 
-        while config.sample_rate.0 as usize / sample_reduction > target_sample_rate {
-            sample_reduction += 1;
-        }
+        let sample_reduction = {
+            let mut sample_reduction: usize = 1;
+            while config.sample_rate.0 as usize / sample_reduction > target_sample_rate {
+                sample_reduction += 1;
+            }
+            sample_reduction
+        };
 
         let fake_sample_rate = config.sample_rate.0 as usize / sample_reduction;
         let sample_skip = config.channels as usize * sample_reduction;
+        let channels = config.channels;
 
         println!(
-            "{} Audio Device: {} {} {} -> {} {:?}",
-            match capture_type { CaptureType::Input => "Input", _ => "Output" },
+            "Audio Device: {} {} {} -> {} {:?}",
             device.name().unwrap(),
             config.channels,
             config.sample_rate.0,
@@ -180,6 +109,7 @@ pub fn capture_loop(to_fft: SyncSender<(usize, Vec<f32>)>, commands: Receiver::<
             move |data: &[f32], _: &cpal::InputCallbackInfo| {
                 to_fft.send((
                     fake_sample_rate,
+                    channels,
                     data
                         .iter()
                         .step_by(sample_skip)

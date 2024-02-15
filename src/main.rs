@@ -9,15 +9,16 @@ use std::io::{Write, stdout};
 mod window;
 
 
-#[cfg(target_os = "windows")]
-mod capture_windows;
-#[cfg(target_os = "windows")]
-use capture_windows::capture_loop;
+mod capture;
+use capture::capture_loop;
 
-#[cfg(target_os = "linux")]
-mod capture_linux;
-#[cfg(target_os = "linux")]
-use capture_linux::capture_loop;
+use crate::capture::CaptureCommand;
+
+
+// use windows::core::Error as WindowsError;
+// use windows::Win32::System::Power::{
+//     SetThreadExecutionState, ES_CONTINUOUS, ES_DISPLAY_REQUIRED, EXECUTION_STATE,
+// };
 
 
 #[macro_use]
@@ -25,7 +26,7 @@ extern crate log;
 use simplelog::*;
 
 
-const FFT_INPUT_SIZE: usize = 2usize.pow(11);
+const FFT_INPUT_SIZE: usize = 2usize.pow(10);
 const FFT_RESULT_SIZE: usize = 2usize.pow(16);
 
 
@@ -40,19 +41,16 @@ fn main() -> Res<()> {
             .build(),
     );
 
-    let (tx_capt, rx_capt): (
-        SyncSender<Vec<u8>>,
-        Receiver<Vec<u8>>,
-    ) = sync_channel(1);
+    let (to_fft, from_audio) = sync_channel::<(usize, u16, Vec<f32>)>(1);
 
-    let (gfx_sender, gfx_receiver) = sync_channel(1);
+    let (to_capture_command, capture_commands) = sync_channel::<CaptureCommand>(1);
 
-    let chunksize = 1024;
+    let (to_gpu, from_fft) = sync_channel(1);
 
     let _ = thread::Builder::new()
         .name("Capture".to_string())
         .spawn(move || {
-            let result = capture_loop(tx_capt, chunksize);
+            let result = capture_loop(to_fft, capture_commands);
             if let Err(err) = result {
                 error!("Capture failed with error {}", err);
             }
@@ -61,10 +59,10 @@ fn main() -> Res<()> {
     let _ = thread::Builder::new()
         .name("FFT".to_string())
         .spawn(move || {
-            fft_loop(rx_capt, gfx_sender);
+            fft_loop(from_audio, to_gpu).unwrap();
         });
 
-    window::window_loop(gfx_receiver);
+    window::window_loop(from_fft, to_capture_command).unwrap();
 
     Ok(())
     
@@ -98,69 +96,60 @@ fn _print_bars(buffer: Vec<f32>){
 }
 
 
-fn fft_loop(raw: Receiver<Vec<u8>>, transformed: SyncSender<Vec<f32>>){
+fn fft_loop(from_audio: Receiver<(usize, u16, Vec<f32>)>, to_gpu: SyncSender<Vec<f32>>) -> Res<()> {
+
+    type Number = f64;
+    let mut planner = FftPlanner::<Number>::new();
+    let fft = planner.plan_fft_forward(FFT_RESULT_SIZE);
+
+    let mut frame: Vec::<Number> = vec![];
+    let mut buffer = vec![Complex{ re: 0 as Number, im: 0 as Number }; FFT_RESULT_SIZE];
+    let mut scratch = vec![Complex{ re: 0 as Number, im: 0 as Number }; FFT_RESULT_SIZE];
+
+    let mut frame_start = Instant::now();
+
     loop {
-        let mut planner = FftPlanner::<f32>::new();
-        let fft = planner.plan_fft_forward(FFT_RESULT_SIZE);
+        match from_audio.recv() {
+            Ok((sample_rate, channels, chunk)) => {
 
-        let mut frame: Vec::<f32> = vec![];
-        let mut buffer = vec![Complex{ re: 0f32, im: 0f32 }; FFT_RESULT_SIZE];
+                let floats: Vec::<Number> =
+                    frame
+                        .into_iter()
+                        .chain(chunk.into_iter().map(|x| x as Number))
+                        .rev()
+                        .take(sample_rate / 30)
+                        .collect::<Vec<Number>>()
+                        .into_iter()
+                        .rev()
+                        .collect();
 
-        let mut frame_start = Instant::now();
+                frame = floats;
 
-        loop {
-            match raw.recv() {
-                Ok(chunk) => {
-                    let floats = unsafe {
-                        let (_, floats_tmp, _) = chunk.align_to::<f32>();
-                        floats_tmp.to_vec()
-                    };
-
-                    let floats: Vec::<f32> =
-                        frame
-                            .into_iter()
-                            .chain(floats.into_iter())
-                            .rev()
-                            .take(FFT_INPUT_SIZE)
-                            .collect::<Vec<f32>>()
-                            .into_iter()
-                            .rev()
-                            .collect();
-
-                    frame = floats;
-
-                    buffer.splice(
-                        0 .. frame.len(),
-                        frame
-                            .clone()
-                            .into_iter()
-                            .rev()
-                            .map(|x| Complex::new(x, 0.0))
-                            .collect::<Vec<Complex<f32>>>()
-                    );
-                    buffer.splice(
-                        frame.len()..buffer.len(),
-                        (frame.len()..buffer.len())
-                            .into_iter()
-                            .map(|_| Complex::new(0.0, 0.0))
-                            .collect::<Vec<Complex<f32>>>()
-                    );
-                }
-                Err(err) => {
-                    eprintln!("Some error {}", err);
-                    break
+                buffer.splice(
+                    0 .. frame.len(),
+                    frame
+                        .iter()
+                        .map(|x| Complex::new(*x*0.75, 0.0))
+                        .collect::<Vec<Complex<Number>>>()
+                );
+                for v in &mut buffer[frame.len()..] {
+                    *v = Complex::new(0.0, 0.0);
                 }
             }
-            
-            if frame_start + Duration::from_millis(3) < Instant::now() {
-                frame_start = Instant::now();
-                fft.process(&mut buffer);
-                // _print_bars(buffer.iter().map(|x| x.to_polar().0).collect::<Vec<f32>>());
-                let mut half = buffer.iter().map(|x| x.to_polar().0).collect::<Vec<f32>>();
-                half = half[0..half.len()/2].to_vec();
-                transformed.try_send(half).ok();
-                print!("FFT {:?}\n", Instant::now() - frame_start);
+            Err(err) => {
+                eprintln!("Some error {}", err);
+                break Err(Box::new(err))
             }
+        }
+        
+        if frame_start + Duration::from_millis(3) < Instant::now() {
+            frame_start = Instant::now();
+            fft.process_with_scratch(&mut buffer, &mut scratch);
+            // _print_bars(buffer.iter().map(|x| x.to_polar().0).collect::<Vec<f32>>());
+            let mut half = buffer.iter().map(|x| x.to_polar().0 as f32).collect::<Vec<f32>>();
+            half = half[0..half.len()/2].to_vec();
+            to_gpu.try_send(half).ok();
+            // print!("FFT {:?}\n", Instant::now() - frame_start);
         }
     }
 }
