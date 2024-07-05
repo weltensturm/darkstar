@@ -27,6 +27,7 @@ pub enum CaptureCommand {
 
 }
 
+#[derive(PartialEq)]
 enum CaptureType {
     Input,
     Output,
@@ -94,7 +95,8 @@ pub fn capture_loop(to_fft: SyncSender<(usize, u16, Vec<f32>)>, commands: Receiv
         let channels = config.channels;
 
         println!(
-            "Audio Device: {} {} {} -> {} {:?}",
+            "{} Audio Device: {} {} {} -> {} {:?}",
+            if capture_type == CaptureType::Output { "Output" } else { "Input" },
             device.name().unwrap(),
             config.channels,
             config.sample_rate.0,
